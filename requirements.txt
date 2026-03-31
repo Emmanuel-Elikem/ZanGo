@@ -6,5 +6,6 @@ click
 rich
 tabulate
 fastapi
+uvicorn[standard]
 gunicorn
 
