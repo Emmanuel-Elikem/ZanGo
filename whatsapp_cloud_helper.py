@@ -6,16 +6,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Meta WhatsApp Cloud API Config
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-API_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+# Meta WhatsApp Cloud API Config (updated to match provided env names)
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_WABA_ID = os.getenv("WHATSAPP_WABA_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+ADMIN_PHONE = os.getenv("ADMIN_PHONE")
+PUBLIC_URL = os.getenv("PUBLIC_URL")
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL")
+
+API_URL = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
 HTTP = requests.Session()
 
 def _build_headers():
     return {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
     }
 
@@ -32,7 +40,7 @@ def _log_meta_error(action, response):
     logging.error(f"❌ {action} failed: HTTP {response.status_code} | code={code} | subcode={subcode} | {message}")
 
 def _post_to_meta(payload, action):
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         logging.error("Cloud API credentials missing.")
         return False
     response = HTTP.post(API_URL, headers=_build_headers(), json=payload, timeout=30)
@@ -149,14 +157,15 @@ def send_whatsapp_image(to, image_url, caption=None):
 
 def fetch_media_bytes(media_id):
     """Download a WhatsApp media asset from the Meta Cloud API."""
-    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+
+    if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         logging.error("Cloud API credentials missing.")
         return None, None
 
     try:
         meta_response = HTTP.get(
             f"{GRAPH_API_BASE}/{media_id}",
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
             timeout=30
         )
         meta_response.raise_for_status()
@@ -169,7 +178,7 @@ def fetch_media_bytes(media_id):
 
         content_response = HTTP.get(
             media_url,
-            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
             timeout=60
         )
         content_response.raise_for_status()

@@ -29,14 +29,21 @@ load_dotenv()
 # =========================
 # CONFIG
 # =========================
-ADMIN_PHONE = os.getenv("ADMIN_PHONE")
-ADMIN_ACCESS_CODE = os.getenv("ADMIN_ACCESS_CODE") or os.getenv("VERIFY_TOKEN", "prim_store_verify")
-MOMO_RECEIVER_NUMBER = os.getenv("MOMO_RECEIVER_NUMBER", "233599966902")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-ngrok-or-domain.com")
 
-# Paystack Configuration
+# Environment Variables (updated to match provided names)
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
+WHATSAPP_WABA_ID = os.getenv("WHATSAPP_WABA_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+ADMIN_PHONE = os.getenv("ADMIN_PHONE")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-ngrok-or-domain.com")
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL", f"{PUBLIC_URL}/payment/callback")
+
+# For backward compatibility (if needed elsewhere)
+MOMO_RECEIVER_NUMBER = os.getenv("MOMO_RECEIVER_NUMBER", "233599966902")
+ADMIN_ACCESS_CODE = os.getenv("ADMIN_ACCESS_CODE") or VERIFY_TOKEN or "prim_store_verify"
 PAYSTACK_INIT_URL = "https://api.paystack.co/transaction/initialize"
 PAYSTACK_VERIFY_URL = "https://api.paystack.co/transaction/verify"
 
