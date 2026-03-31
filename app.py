@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import sys
 import threading
 import time
@@ -52,6 +53,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "prim_store.db")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is not set")
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
 SESSIONS_FILE = os.path.join(BASE_DIR, "sessions.json")
 STATIC_FOLDER = os.path.join(BASE_DIR, 'static')
 IMAGES_FOLDER = os.path.join(STATIC_FOLDER, 'images')
@@ -69,7 +78,7 @@ def static_files(filename):
 # DATABASE
 # =========================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     # Users: phone, name, role (buyer/seller/admin), zone, created_at
     c.execute('''CREATE TABLE IF NOT EXISTS users (
@@ -84,7 +93,7 @@ def init_db():
     )''')
     # Products: associated with a seller
     c.execute('''CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         seller_phone TEXT NOT NULL,
         name TEXT NOT NULL,
         description TEXT,
@@ -96,7 +105,7 @@ def init_db():
     )''')
     # Orders
     c.execute('''CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         buyer_phone TEXT NOT NULL,
         seller_phone TEXT NOT NULL,
         total_price REAL NOT NULL,
@@ -112,7 +121,7 @@ def init_db():
     )''')
     # Order Items
     c.execute('''CREATE TABLE IF NOT EXISTS order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         order_id INTEGER NOT NULL,
         product_id INTEGER NOT NULL,
         quantity INTEGER NOT NULL,
@@ -133,7 +142,7 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS seller_requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         seller_phone TEXT NOT NULL UNIQUE,
         seller_name TEXT,
         shop_name TEXT,
@@ -148,14 +157,14 @@ def init_db():
     )''')
 
     def existing_columns(table_name):
-        c.execute(f"PRAGMA table_info({table_name})")
-        return {row[1] for row in c.fetchall()}
+        c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table_name,))
+        return {row[0] for row in c.fetchall()}
 
     def add_column_if_missing(table_name, column_name, definition):
         if column_name not in existing_columns(table_name):
             try:
                 c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-            except sqlite3.OperationalError as exc:
+            except psycopg2.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
 
@@ -353,14 +362,58 @@ def save_json(path, data):
     except Exception as e:
         logging.error(f"Save error: {e}")
 
+
+def get_session(phone):
+    normalized = normalize_phone(phone)
+    conn = get_db_connection()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM sessions WHERE phone = %s", (normalized,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        session = {"state": row["state"], "cart": row["cart"] or []}
+        session.update(row["data"] or {})
+        return session
+    return {"state": "new_user", "data": {}, "cart": []}
+
+def save_session(phone, session):
+    normalized = normalize_phone(phone)
+    state = session.get("state", "new_user")
+    cart = session.get("cart", [])
+    
+    # Extract data (everything except state and cart)
+    session_data = {k: v for k, v in session.items() if k not in ("state", "cart")}
+    
+    data_json = json.dumps(session_data)
+    cart_json = json.dumps(cart)
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO sessions (phone, state, data, cart, updated_at)
+        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (phone) DO UPDATE 
+        SET state = EXCLUDED.state,
+            data = EXCLUDED.data,
+            cart = EXCLUDED.cart,
+            updated_at = EXCLUDED.updated_at
+    """, (normalized, state, data_json, cart_json))
+    conn.commit()
+    conn.close()
+
 def reset_user_session(phone, state="idle", data=None, keep_cart=False):
     normalized_phone = normalize_phone(phone)
-    sessions = load_json(SESSIONS_FILE, {})
-    session_record = {"state": state, "data": data or {}}
-    if keep_cart and normalized_phone in sessions and isinstance(sessions[normalized_phone].get("cart"), list):
-        session_record["cart"] = sessions[normalized_phone]["cart"]
-    sessions[normalized_phone] = session_record
-    save_json(SESSIONS_FILE, sessions)
+    if data is None:
+        data = {}
+    
+    session_data = get_session(normalized_phone) if keep_cart else {"cart": []}
+    new_session = {
+        "state": state,
+        "data": data,
+        "cart": session_data.get("cart", [])
+    }
+    save_session(normalized_phone, new_session)
+
 
 def show_onboarding_seller_image_choice(phone):
     buttons = [
@@ -412,9 +465,9 @@ SCHEMA_CACHE = {}
 
 def get_table_columns(table_name):
     if table_name not in SCHEMA_CACHE:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute(f"PRAGMA table_info({table_name})")
+        c.execute("SELECT column_name FROM information_schema.columns WHERE table_name = %s", (table_name,))
         SCHEMA_CACHE[table_name] = {row[1] for row in c.fetchall()}
         conn.close()
     return SCHEMA_CACHE[table_name]
@@ -533,7 +586,7 @@ def fetch_available_shops():
     if cached["value"] is not None and cached["expires_at"] > time.time():
         return cached["value"]
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT u.phone, u.shop_name, u.shop_description, u.zone, u.landmark, u.shop_image_url
@@ -558,19 +611,19 @@ def fetch_shop_catalog(seller_phone):
     if cached and cached["expires_at"] > time.time():
         return cached["value"]
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT id, name, price, description, image_url, stock
         FROM products
-        WHERE seller_phone = ? AND stock > 0
+        WHERE seller_phone = %s AND stock > 0
         ORDER BY id DESC
     """, (normalized_seller_phone,))
     products = c.fetchall()
     c.execute("""
         SELECT shop_name, shop_description, zone, landmark, shop_image_url
         FROM users
-        WHERE phone = ?
+        WHERE phone = %s
     """, (normalized_seller_phone,))
     shop = c.fetchone()
     conn.close()
@@ -597,13 +650,13 @@ def format_order_status(status):
     return f"{icon} {label}"
 
 def get_order_record_by_reference(reference):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT id, buyer_phone, seller_phone, total_price, pickup_or_delivery, delivery_zone,
                delivery_landmark, delivery_address, status, confirmation_code
         FROM ({get_orders_view_sql()}) AS orders_view
-        WHERE payment_ref = ?
+        WHERE payment_ref = %s
         LIMIT 1
     """, (reference,))
     order = c.fetchone()
@@ -666,23 +719,23 @@ def generate_seller_code():
     import random
     import string
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     while True:
         code = "SELL-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        c.execute("SELECT 1 FROM seller_invites WHERE code = ?", (code,))
+        c.execute("SELECT 1 FROM seller_invites WHERE code = %s", (code,))
         if not c.fetchone():
             conn.close()
             return code
 
 def create_seller_invite(seller_phone, seller_name, shop_name, shop_description, shop_image_url, zone, landmark, created_by):
     code = generate_seller_code()
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
-        INSERT OR REPLACE INTO seller_invites
+        INSERT INTO seller_invites
         (code, seller_phone, seller_name, shop_name, shop_description, shop_image_url, zone, landmark, created_by, status, claimed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', NULL) ON CONFLICT (code) DO UPDATE SET seller_phone = excluded.seller_phone, seller_name = excluded.seller_name, shop_name = excluded.shop_name, shop_description = excluded.shop_description, shop_image_url = excluded.shop_image_url, zone = excluded.zone, landmark = excluded.landmark, status = 'active', claimed_at = NULL
     """, (
         code,
         normalize_phone(seller_phone),
@@ -699,12 +752,12 @@ def create_seller_invite(seller_phone, seller_name, shop_name, shop_description,
     return code
 
 def get_seller_invite(code):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT code, seller_phone, seller_name, shop_name, shop_description, shop_image_url, zone, landmark, status, claimed_at
         FROM seller_invites
-        WHERE UPPER(code) = UPPER(?)
+        WHERE UPPER(code) = UPPER(%s)
     """, (code.strip(),))
     invite = c.fetchone()
     conn.close()
@@ -720,12 +773,12 @@ def claim_seller_invite(code, claimant_phone):
     if normalize_phone(invite[1]) != normalized_phone:
         return None, "That code is assigned to a different phone number."
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         UPDATE seller_invites
         SET status = 'claimed', claimed_at = CURRENT_TIMESTAMP
-        WHERE code = ?
+        WHERE code = %s
     """, (invite[0],))
     conn.commit()
     conn.close()
@@ -735,12 +788,12 @@ def create_seller_request(seller_phone, seller_name, zone, landmark="", shop_nam
     normalized_phone = normalize_phone(seller_phone)
     seller_name = (seller_name or "").strip()
     fallback_shop_name = shop_name or (f"{seller_name.split()[0]}'s Shop" if seller_name else "New Seller Shop")
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         INSERT INTO seller_requests
         (seller_phone, seller_name, shop_name, shop_description, shop_image_url, zone, landmark, status, reviewed_by, reviewed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', NULL, NULL)
         ON CONFLICT(seller_phone) DO UPDATE SET
             seller_name = excluded.seller_name,
             shop_name = excluded.shop_name,
@@ -760,34 +813,34 @@ def create_seller_request(seller_phone, seller_name, zone, landmark="", shop_nam
         zone or "",
         landmark or "",
     ))
-    c.execute("SELECT id FROM seller_requests WHERE seller_phone = ?", (normalized_phone,))
+    c.execute("SELECT id FROM seller_requests WHERE seller_phone = %s", (normalized_phone,))
     request_id = c.fetchone()[0]
     conn.commit()
     conn.close()
     return request_id
 
 def get_pending_seller_requests(limit=20):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT id, seller_phone, seller_name, shop_name, zone, landmark, created_at
         FROM seller_requests
         WHERE status = 'pending'
         ORDER BY created_at DESC
-        LIMIT ?
+        LIMIT %s
     """, (limit,))
     requests = c.fetchall()
     conn.close()
     return requests
 
 def get_seller_request(request_id):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT id, seller_phone, seller_name, shop_name, shop_description, shop_image_url,
                zone, landmark, status, reviewed_by, created_at, reviewed_at
         FROM seller_requests
-        WHERE id = ?
+        WHERE id = %s
         LIMIT 1
     """, (request_id,))
     request_row = c.fetchone()
@@ -795,12 +848,12 @@ def get_seller_request(request_id):
     return request_row
 
 def update_seller_request_status(request_id, status, reviewed_by=None):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         UPDATE seller_requests
-        SET status = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        SET status = %s, reviewed_by = %s, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = %s
     """, (status, normalize_phone(reviewed_by) if reviewed_by else None, request_id))
     conn.commit()
     conn.close()
@@ -942,7 +995,7 @@ def verify_paystack_payment(reference):
 # DB FUNCTIONS
 # =========================
 def get_products():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT id, name, description, price, stock, image_url, seller_phone FROM products WHERE stock > 0")
     prods = c.fetchall()
@@ -950,20 +1003,20 @@ def get_products():
     return prods
 
 def get_product_by_id(pid):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT seller_phone, id, name, price, stock, image_url FROM products WHERE id = ?", (pid,))
+    c.execute("SELECT seller_phone, id, name, price, stock, image_url FROM products WHERE id = %s", (pid,))
     prod = c.fetchone()
     conn.close()
     return prod
 
 def get_seller_product(pid, seller_phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT id, seller_phone, name, description, price, stock, image_url
         FROM products
-        WHERE id = ? AND seller_phone = ?
+        WHERE id = %s AND seller_phone = %s
     """, (pid, normalize_phone(seller_phone)))
     prod = c.fetchone()
     conn.close()
@@ -975,15 +1028,15 @@ def update_product_details(pid, seller_phone, **fields):
     values = []
     for key, value in fields.items():
         if key in allowed:
-            updates.append(f"{key} = ?")
+            updates.append(f"{key} = %s")
             values.append(value)
     if not updates:
         return False
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     values.extend([pid, normalize_phone(seller_phone)])
-    c.execute(f"UPDATE products SET {', '.join(updates)} WHERE id = ? AND seller_phone = ?", values)
+    c.execute(f"UPDATE products SET {', '.join(updates)} WHERE id = %s AND seller_phone = %s", values)
     conn.commit()
     updated = c.rowcount > 0
     conn.close()
@@ -992,9 +1045,9 @@ def update_product_details(pid, seller_phone, **fields):
     return updated
 
 def delete_product(pid, seller_phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM products WHERE id = ? AND seller_phone = ?", (pid, normalize_phone(seller_phone)))
+    c.execute("DELETE FROM products WHERE id = %s AND seller_phone = %s", (pid, normalize_phone(seller_phone)))
     conn.commit()
     deleted = c.rowcount > 0
     conn.close()
@@ -1003,26 +1056,26 @@ def delete_product(pid, seller_phone):
     return deleted
 
 def get_seller_orders(seller_phone, limit=10):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT id, buyer_phone, total_price, status, pickup_or_delivery, delivery_zone, delivery_landmark, delivery_address, confirmation_code, payment_ref, created_at
         FROM ({get_orders_view_sql()}) AS orders_view
-        WHERE seller_phone = ?
+        WHERE seller_phone = %s
         ORDER BY created_at DESC
-        LIMIT ?
+        LIMIT %s
     """, (normalize_phone(seller_phone), limit))
     orders = c.fetchall()
     conn.close()
     return orders
 
 def get_seller_order(order_id, seller_phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT id, buyer_phone, seller_phone, total_price, delivery_fee, delivery_zone, delivery_landmark, delivery_address, pickup_or_delivery, status, payment_ref, confirmation_code, created_at
         FROM ({get_orders_view_sql()}) AS orders_view
-        WHERE id = ? AND seller_phone = ?
+        WHERE id = %s AND seller_phone = %s
         LIMIT 1
     """, (order_id, normalize_phone(seller_phone)))
     order = c.fetchone()
@@ -1042,9 +1095,9 @@ def get_user(phone):
     # Normalize phone for database lookup - try both with and without +
     normalized = normalize_phone(phone)
     with_plus = f"+{normalized}"
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT phone, name, shop_name, shop_description, role, zone, shop_image_url, landmark FROM users WHERE phone = ? OR phone = ? OR phone = ?", 
+    c.execute("SELECT phone, name, shop_name, shop_description, role, zone, shop_image_url, landmark FROM users WHERE phone = %s OR phone = %s OR phone = %s", 
               (normalized, with_plus, phone))
     user = c.fetchone()
     conn.close()
@@ -1061,41 +1114,41 @@ USER_LANDMARK = 7
 
 def create_user(phone, name=None, role='buyer', zone=None, landmark=None):
     normalized_phone = normalize_phone(phone)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (phone, name, role, zone, landmark) VALUES (?, ?, ?, ?, ?)",
+    c.execute("INSERT INTO users (phone, name, role, zone, landmark) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (phone) DO NOTHING",
               (normalized_phone, name, role, zone, landmark))
     c.execute("""
         UPDATE users
-        SET name = COALESCE(?, name),
-            role = COALESCE(?, role),
-            zone = COALESCE(?, zone),
-            landmark = COALESCE(?, landmark)
-        WHERE phone = ?
+        SET name = COALESCE(%s, name),
+            role = COALESCE(%s, role),
+            zone = COALESCE(%s, zone),
+            landmark = COALESCE(%s, landmark)
+        WHERE phone = %s
     """, (name, role, zone, landmark, normalized_phone))
     conn.commit()
     conn.close()
 
 def update_user(phone, name=None, role=None, zone=None, landmark=None):
     normalized_phone = normalize_phone(phone)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    if name: c.execute("UPDATE users SET name = ? WHERE phone = ?", (name, normalized_phone))
-    if role: c.execute("UPDATE users SET role = ? WHERE phone = ?", (role, normalized_phone))
-    if zone: c.execute("UPDATE users SET zone = ? WHERE phone = ?", (zone, normalized_phone))
-    if landmark: c.execute("UPDATE users SET landmark = ? WHERE phone = ?", (landmark, normalized_phone))
+    if name: c.execute("UPDATE users SET name = %s WHERE phone = %s", (name, normalized_phone))
+    if role: c.execute("UPDATE users SET role = %s WHERE phone = %s", (role, normalized_phone))
+    if zone: c.execute("UPDATE users SET zone = %s WHERE phone = %s", (zone, normalized_phone))
+    if landmark: c.execute("UPDATE users SET landmark = %s WHERE phone = %s", (landmark, normalized_phone))
     conn.commit()
     conn.close()
 
 def get_product_details(pid):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT p.seller_phone, p.id, p.name, p.description, p.price, p.stock, p.image_url,
                u.shop_name, u.shop_description, u.zone, u.landmark
         FROM products p
         LEFT JOIN users u ON u.phone = p.seller_phone
-        WHERE p.id = ?
+        WHERE p.id = %s
         LIMIT 1
     """, (pid,))
     product = c.fetchone()
@@ -1108,7 +1161,7 @@ def search_market_catalog(query, limit=10):
         return []
     like_query = f"%{cleaned}%"
     prefix_query = f"{cleaned}%"
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT p.id, p.name, p.price, p.description, p.stock, p.image_url, p.seller_phone,
@@ -1117,21 +1170,21 @@ def search_market_catalog(query, limit=10):
         JOIN users u ON u.phone = p.seller_phone
         WHERE p.stock > 0
           AND (
-              LOWER(p.name) LIKE ?
-              OR LOWER(COALESCE(p.description, '')) LIKE ?
-              OR LOWER(COALESCE(u.shop_name, '')) LIKE ?
+              LOWER(p.name) LIKE %s
+              OR LOWER(COALESCE(p.description, '')) LIKE %s
+              OR LOWER(COALESCE(u.shop_name, '')) LIKE %s
           )
         ORDER BY
-            CASE WHEN LOWER(p.name) LIKE ? THEN 0 ELSE 1 END,
+            CASE WHEN LOWER(p.name) LIKE %s THEN 0 ELSE 1 END,
             p.id DESC
-        LIMIT ?
+        LIMIT %s
     """, (like_query, like_query, like_query, prefix_query, limit))
     results = c.fetchall()
     conn.close()
     return results
 
 def get_buyer_orders(buyer_phone, limit=8):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT o.id, o.total_price, o.status, o.pickup_or_delivery, o.delivery_zone,
@@ -1139,16 +1192,16 @@ def get_buyer_orders(buyer_phone, limit=8):
                u.shop_name
         FROM ({get_orders_view_sql()}) AS o
         LEFT JOIN users u ON u.phone = o.seller_phone
-        WHERE o.buyer_phone = ?
+        WHERE o.buyer_phone = %s
         ORDER BY o.created_at DESC
-        LIMIT ?
+        LIMIT %s
     """, (normalize_phone(buyer_phone), limit))
     orders = c.fetchall()
     conn.close()
     return orders
 
 def get_buyer_order(order_id, buyer_phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT o.id, o.buyer_phone, o.seller_phone, o.total_price, o.delivery_fee, o.delivery_zone,
@@ -1156,7 +1209,7 @@ def get_buyer_order(order_id, buyer_phone):
                o.payment_ref, o.confirmation_code, o.created_at, u.shop_name
         FROM ({get_orders_view_sql()}) AS o
         LEFT JOIN users u ON u.phone = o.seller_phone
-        WHERE o.id = ? AND o.buyer_phone = ?
+        WHERE o.id = %s AND o.buyer_phone = %s
         LIMIT 1
     """, (order_id, normalize_phone(buyer_phone)))
     order = c.fetchone()
@@ -1169,14 +1222,14 @@ def get_order_items(order_id):
     addon_expr = "oi.addon_text" if "addon_text" in item_columns else "NULL"
     instructions_expr = "oi.special_instructions" if "special_instructions" in item_columns else "NULL"
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT oi.product_id, {item_name_expr} AS item_name, oi.quantity, oi.price_at_purchase,
                {addon_expr} AS addon_text, {instructions_expr} AS special_instructions
         FROM order_items oi
         LEFT JOIN products p ON p.id = oi.product_id
-        WHERE oi.order_id = ?
+        WHERE oi.order_id = %s
         ORDER BY oi.id ASC
     """, (order_id,))
     items = c.fetchall()
@@ -1193,11 +1246,7 @@ def process_message(from_phone, msg_body, is_interactive=False, metadata=None):
     logging.info(f"Incoming from {normalized_phone}: {msg_body}")
 
     # Session management - use normalized phone
-    sessions = load_json(SESSIONS_FILE, {})
-    session_key = normalized_phone
-    if session_key not in sessions:
-        sessions[session_key] = {"state": "start", "data": {}}
-    session = sessions[session_key]
+    session = get_session(from_phone)
 
     user = get_user(normalized_phone)
     
@@ -1208,19 +1257,20 @@ def process_message(from_phone, msg_body, is_interactive=False, metadata=None):
         
         # Admin always uses the admin flow first
         if is_admin:
-            handle_admin_flow(from_phone, msg_body, session)
+            handle_admin_flow(from_phone, msg_body, session, is_interactive, metadata)
         # New user OR in onboarding flow
-        elif not user or session["state"].startswith("onboarding_"):
-            handle_onboarding(from_phone, msg_body, session)
+        elif not user or session["state"] in ("new_user", "start") or session["state"].startswith("onboarding_") or session["state"].startswith("buyer_onboarding_") or session["state"].startswith("seller_onboarding_"):
+            handle_onboarding(from_phone, msg_body, session, is_interactive, metadata)
         # Existing user - route based on role
         elif user[USER_ROLE] == 'seller':
-            handle_seller_flow(from_phone, msg_body, session, user)
+            handle_seller_flow(from_phone, msg_body, session, user, is_interactive, metadata)
         elif user[USER_ROLE] == 'buyer':
-            handle_buyer_flow(from_phone, msg_body, session, user)
+            handle_buyer_flow(from_phone, msg_body, session, user, is_interactive, metadata)
         else:
-            send_text(from_phone, "Welcome! Type 'menu' to see your options.")
+            from whatsapp_cloud_helper import get_whatsapp_cloud
+            get_whatsapp_cloud().send_whatsapp_message(from_phone, "Welcome! Type 'menu' to see your options.")
 
-        save_json(SESSIONS_FILE, sessions)
+        save_session(from_phone, session)
         return True
     except Exception as e:
         logging.exception(f"Error in process_message: {e}")
@@ -1240,10 +1290,9 @@ def twilio_webhook():
     media_url = data.get("MediaUrl0") 
 
     if media_url:
-        sessions = load_json(SESSIONS_FILE, {})
-        if normalized_phone in sessions:
-            sessions[normalized_phone]["pending_image"] = media_url
-            save_json(SESSIONS_FILE, sessions)
+        session = get_session(normalized_phone)
+        session["pending_image"] = media_url
+        save_session(normalized_phone, session)
 
     process_message(from_phone, msg_body)
     return "OK", 200
@@ -1285,10 +1334,7 @@ def whatsapp_webhook():
             msg_type = msg.get("type", "text")
         
             # Session management for media
-            sessions = load_json(SESSIONS_FILE, {})
-            if normalized_phone not in sessions:
-                sessions[normalized_phone] = {"state": "start", "data": {}}
-            session = sessions[normalized_phone]
+            session = get_session(normalized_phone)
             
             # Handle different message types
             msg_body = ""
@@ -1312,23 +1358,23 @@ def whatsapp_webhook():
                     session["pending_image_id"] = image_url
                     session["pending_image_url"] = image.get("link", "")
                     if handle_onboarding_seller_image_upload(from_phone, session, image_url):
-                        save_json(SESSIONS_FILE, sessions)
+                        save_session(from_phone, session)
                         return "OK", 200
                     if handle_admin_seller_image_upload(from_phone, session, image_url):
-                        save_json(SESSIONS_FILE, sessions)
+                        save_session(from_phone, session)
                         return "OK", 200
                     if handle_seller_image_upload(from_phone, session, image_url):
-                        save_json(SESSIONS_FILE, sessions)
+                        save_session(from_phone, session)
                         return "OK", 200
                 # Send acknowledgment
                 cloud.send_whatsapp_message(from_phone, "📷 Image received. When you're in an image upload step, I'll attach it automatically.")
-                save_json(SESSIONS_FILE, sessions)
+                save_session(from_phone, session)
                 return "OK", 200
             elif msg_type == "audio":
                 # Handle audio messages
                 audio = msg.get("audio", {})
                 session["pending_audio_id"] = audio.get("id", "")
-                save_json(SESSIONS_FILE, sessions)
+                save_session(from_phone, session)
                 return "OK", 200
             
             if msg_body:
@@ -1346,21 +1392,46 @@ def send_text(to, text):
 # =========================
 # ONBOARDING FLOW
 # =========================
-def handle_onboarding(phone, text, session):
-    state = session["state"]
+def handle_onboarding(phone, text, session, is_interactive=False, metadata=None):
+    from whatsapp_cloud_helper import get_whatsapp_cloud
+    import re
+    cloud = get_whatsapp_cloud()
+    
+    state = session.get("state", "new_user")
     text = (text or "").strip()
+    
+    interactive_id = metadata.get("id") if is_interactive and metadata else None
 
     if state == "start":
+        state = "new_user"
+
+    if state == "new_user":
         msg = (
-            "🍽️ *Welcome to ZanChop UCC*\n\n"
-            "Campus cravings, handled beautifully.\n"
-            "Browse trusted restaurants, order in minutes, and pay securely.\n\n"
-            "Let's get your profile ready. What's your *full name*?"
+            "🍽️ *Welcome to Zan Chop!*\n"
+            "Your favourite food, delivered fast across Cape Coast. UCC campus and beyond.\n\n"
+            "What would you like to do?"
         )
-        cloud.send_whatsapp_message(phone, msg)
-        session["state"] = "onboarding_name"
-    
-    elif state == "onboarding_name":
+        buttons = [
+            {"id": "btn_buy_food", "title": "🛒 Buy Food"},
+            {"id": "btn_sell_food", "title": "🏪 Sell Food"}
+        ]
+        cloud.send_interactive_buttons(phone, msg, buttons)
+        session["state"] = "onboarding_role_selection"
+
+    elif state == "onboarding_role_selection":
+        if is_interactive and interactive_id == "btn_buy_food":
+            cloud.send_whatsapp_message(phone, "Let's get your profile ready. What's your *full name*?")
+            session["state"] = "buyer_onboarding_name"
+            session["data"]["role"] = "buyer"
+        elif is_interactive and interactive_id == "btn_sell_food":
+            cloud.send_whatsapp_message(phone, "Let's build your shop profile for admin approval.\n\nWhat is your *full name*?")
+            session["state"] = "seller_onboarding_name"
+            session["data"]["role"] = "seller"
+        else:
+            cloud.send_whatsapp_message(phone, "Please tap one of the buttons above to continue.")
+
+    # ----------- BUYER ONBOARDING -----------
+    elif state == "buyer_onboarding_name":
         session["data"]["name"] = text
         zones = []
         for i, zone in enumerate(UCC_ZONES.keys(), 1):
@@ -1368,85 +1439,86 @@ def handle_onboarding(phone, text, session):
             zones.append({"id": f"zone_{i}", "title": zone, "description": truncate_text(preview, 72)})
         
         sections = [{"title": "Select Your Zone", "rows": zones}]
-        success = cloud.send_interactive_list(
+        cloud.send_interactive_list(
             phone, 
             f"✅ Great, {text}!\n\n📍 Which campus zone are you in?", 
             "Select Zone", 
             sections
         )
-        if not success:
-            msg = f"✅ Great, {text}!\n\nChoose your campus zone:\n"
-            for i, zone in enumerate(UCC_ZONES.keys(), 1):
-                preview = ", ".join(DELIVERY_ZONES.get(zone, {}).get("landmarks", [])[:2])
-                msg += f"{i}. {zone}"
-                if preview:
-                    msg += f" - {preview}"
-                msg += "\n"
-            cloud.send_whatsapp_message(phone, msg)
-        session["state"] = "onboarding_zone"
+        session["state"] = "buyer_onboarding_zone"
         
-    elif state == "onboarding_zone":
-        zone_name = resolve_zone_choice(text)
+    elif state == "buyer_onboarding_zone":
+        if is_interactive and interactive_id and interactive_id.startswith("zone_"):
+            try:
+                idx = int(interactive_id.split("_")[1]) - 1
+                zone_name = list(UCC_ZONES.keys())[idx]
+            except:
+                zone_name = None
+        else:
+            zone_name = resolve_zone_choice(text)
+            
         if zone_name:
             session["data"]["zone"] = zone_name
-            
-            buttons = [
-                {"id": "role_buyer", "title": "🛒 I want to BUY"},
-                {"id": "role_seller", "title": "🍔 I want to SELL"}
-            ]
-            success = cloud.send_interactive_buttons(
-                phone,
-                f"📍 *Zone: {zone_name}*\n\nFinal step! How do you want to use ZanChop?",
-                buttons
-            )
-            if not success:
-                cloud.send_whatsapp_message(phone, f"📍 Zone: {zone_name}\n\n1. I want to BUY\n2. I want to SELL")
-            session["state"] = "onboarding_role"
+            cloud.send_whatsapp_message(phone, f"📍 *Zone: {zone_name}*\n\nAlmost done! Please enter your specific *address or landmark*:")
+            session["state"] = "buyer_onboarding_address"
         else:
-            cloud.send_whatsapp_message(phone, "❌ Invalid selection. Please select your zone from the menu.")
+            cloud.send_whatsapp_message(phone, "Please select a valid zone from the list.")
             
-    elif state == "onboarding_role":
-        role = ""
-        if "buyer" in text.lower(): role = "buyer"
-        elif "seller" in text.lower(): role = "seller"
+    elif state == "buyer_onboarding_address":
+        session["data"]["landmark"] = text
+        finalize_onboarding(phone, session)
+
+    # ----------- SELLER ONBOARDING -----------
+    elif state == "seller_onboarding_name":
+        session["data"]["name"] = text
+        cloud.send_whatsapp_message(phone, "Great! What is your *restaurant/shop name*?")
+        session["state"] = "seller_onboarding_shopname"
         
-        if not role:
-            cloud.send_whatsapp_message(phone, "❌ Please tap one of the buttons.")
-            return
-
-        session["data"]["role"] = role
-        if role == "seller":
-            cloud.send_whatsapp_message(
-                phone,
-                "🏪 *Seller Setup*\n\nLet's build your shop profile for admin approval.\n\nWhat is your *shop name*?"
-            )
-            session["state"] = "onboarding_seller_shop_name"
-        else:
-            finalize_onboarding(phone, session)
-
-    elif state == "onboarding_seller_shop_name":
+    elif state == "seller_onboarding_shopname":
         session["data"]["shop_name"] = text
-        cloud.send_whatsapp_message(
-            phone,
-            "📝 *Shop Description*\n\nGive a short description of what you sell.\nExample: Home-style jollof, fried rice, and drinks"
-        )
-        session["state"] = "onboarding_seller_shop_desc"
-
-    elif state == "onboarding_seller_shop_desc":
+        cloud.send_whatsapp_message(phone, "Can you provide a short *description* of what you sell? (e.g., 'Best waakye and jollof on campus!')")
+        session["state"] = "seller_onboarding_details"
+        
+    elif state == "seller_onboarding_details":
         session["data"]["shop_desc"] = text
-        show_landmark_picker(phone, session["data"].get("zone", ""), "onboarding_seller_landmark", header_text="Shop Landmark")
-        session["state"] = "onboarding_seller_landmark"
+        zones = []
+        for i, zone in enumerate(UCC_ZONES.keys(), 1):
+            preview = ", ".join(DELIVERY_ZONES.get(zone, {}).get("landmarks", [])[:2]) or "Popular campus area"
+            zones.append({"id": f"zone_{i}", "title": zone, "description": truncate_text(preview, 72)})
+        
+        sections = [{"title": "Select Shop Zone", "rows": zones}]
+        cloud.send_interactive_list(
+            phone, 
+            "📍 Which campus zone is your shop located in?", 
+            "Select Zone", 
+            sections
+        )
+        session["state"] = "seller_onboarding_zone"
 
-    elif state == "onboarding_seller_landmark":
-        zone = session["data"].get("zone")
-        landmark = resolve_landmark_choice(zone, text.replace("onboarding_seller_landmark_", "landmark_"))
-        if not landmark:
-            cloud.send_whatsapp_message(phone, "❌ Landmark not found. Please tap a valid landmark.")
-            return
-        session["data"]["landmark"] = landmark
+    elif state == "seller_onboarding_zone":
+        if is_interactive and interactive_id and interactive_id.startswith("zone_"):
+            try:
+                idx = int(interactive_id.split("_")[1]) - 1
+                zone_name = list(UCC_ZONES.keys())[idx]
+            except:
+                zone_name = None
+        else:
+            zone_name = resolve_zone_choice(text)
+            
+        if zone_name:
+            session["data"]["zone"] = zone_name
+            cloud.send_whatsapp_message(phone, f"📍 *Zone: {zone_name}*\n\nPlease provide a specific *landmark or address* for your shop:")
+            session["state"] = "seller_onboarding_landmark"
+        else:
+            cloud.send_whatsapp_message(phone, "Please select a valid zone from the list.")
+
+    elif state == "seller_onboarding_landmark":
+        session["data"]["landmark"] = text
+        # Send to image attachment logic
         show_onboarding_seller_image_choice(phone)
         session["state"] = "onboarding_seller_image_choice"
-
+        
+    # Standardised backwards compatibility to existing UI flows for sellers image upload
     elif state == "onboarding_seller_image_choice":
         if text in {"seller_onboard_image_device", "1"}:
             cloud.send_whatsapp_message(phone, "📷 Send your shop image from your device now, or tap Skip to continue without one.")
@@ -1460,12 +1532,14 @@ def handle_onboarding(phone, text, session):
         elif text in {"seller_onboard_image_skip", "3", "skip"}:
             session["data"]["shop_image_url"] = ""
             submit_seller_request(phone, session)
+            session["state"] = "seller_pending"
         else:
             cloud.send_whatsapp_message(phone, "❌ Choose Upload Photo, Add Link, or Skip.")
 
     elif state == "onboarding_seller_image_input":
         session["data"]["shop_image_url"] = "" if text.lower() == "skip" else text
         submit_seller_request(phone, session)
+        session["state"] = "seller_pending"
 
     elif state == "onboarding_seller_image_upload":
         cloud.send_whatsapp_message(phone, "📷 Send the shop image from your device, or use the Skip button.")
@@ -1725,12 +1799,12 @@ def show_seller_dashboard(phone, user):
         )
 
 def show_seller_products_menu(phone, seller_phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT id, name, price, description
         FROM products
-        WHERE seller_phone = ?
+        WHERE seller_phone = %s
         ORDER BY id DESC
         LIMIT 10
     """, (normalize_phone(seller_phone),))
@@ -1862,25 +1936,25 @@ def show_seller_order_actions(phone, order):
 
 def update_user_shop(phone, shop_name=None, shop_desc=None, shop_image_url=None, landmark=None):
     normalized_phone = normalize_phone(phone)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     updates = []
     values = []
     if shop_name is not None:
-        updates.append("shop_name = ?")
+        updates.append("shop_name = %s")
         values.append(shop_name)
     if shop_desc is not None:
-        updates.append("shop_description = ?")
+        updates.append("shop_description = %s")
         values.append(shop_desc)
     if shop_image_url is not None:
-        updates.append("shop_image_url = ?")
+        updates.append("shop_image_url = %s")
         values.append(shop_image_url)
     if landmark is not None:
-        updates.append("landmark = ?")
+        updates.append("landmark = %s")
         values.append(landmark)
     if updates:
         values.append(normalized_phone)
-        c.execute(f"UPDATE users SET {', '.join(updates)} WHERE phone = ?", values)
+        c.execute(f"UPDATE users SET {', '.join(updates)} WHERE phone = %s", values)
     conn.commit()
     conn.close()
     if updates:
@@ -1968,9 +2042,10 @@ def handle_onboarding_seller_image_upload(phone, session, media_id):
 # =========================
 # SELLER FLOW
 # =========================
-def handle_seller_flow(phone, text, session, user):
+def handle_seller_flow(phone, text, session, user, is_interactive=False, metadata=None):
     state = session.get("state", "idle")
-    text_lower = text.lower().strip()
+    text = (metadata or text or "").strip()
+    text_lower = text.lower()
     session.setdefault("data", {})
 
     if text_lower == "add":
@@ -1988,12 +2063,12 @@ def handle_seller_flow(phone, text, session, user):
             cloud.send_whatsapp_message(phone, "🍔 *New Menu Item*\n\nEnter the food name.\nExample: Jollof Rice with Chicken")
             session["state"] = "seller_add_name"
         elif text in {"seller_products", "seller_menu"}:
-            conn = sqlite3.connect(DB_FILE)
+            conn = get_db_connection()
             c = conn.cursor()
             c.execute("""
                 SELECT id
                 FROM products
-                WHERE seller_phone = ?
+                WHERE seller_phone = %s
                 ORDER BY id DESC
                 LIMIT 10
             """, (normalize_phone(phone),))
@@ -2393,542 +2468,6 @@ def list_seller_orders(phone):
 # =========================
 # BUYER FLOW
 # =========================
-def handle_buyer_flow(phone, text, session, user):
-    state = session.get("state", "idle")
-    text_lower = text.lower()
-
-    # Handle start state or menu command - show main menu with buttons
-    # Also show menu when user types "menu" from any state
-    if text_lower == "hi" or text_lower == "menu" or text_lower == "home" or state in ["idle", "start"]:
-        buttons = [
-            {"id": "browse", "title": "🍔 Browse Shops"},
-            {"id": "orders", "title": "📦 My Orders"},
-            {"id": "profile", "title": "👤 My Profile"}
-        ]
-        success = cloud.send_interactive_buttons(
-            phone,
-            f"Hello {user[USER_NAME]}! 👋\n\nWelcome to *ZanChop UCC*.\nFresh campus meals, simple pickup or delivery, and secure Paystack checkout.\n\nWhat would you like to do?",
-            buttons,
-            header_text="ZanChop | Main Menu"
-        )
-        if not success:
-            # Fallback to text if buttons fail
-            cloud.send_whatsapp_message(
-                phone,
-                f"👋 Hello {user[USER_NAME]}!\n\nWelcome to *ZanChop UCC*\nFresh campus meals, simple pickup or delivery, and secure Paystack checkout.\n\nChoose an option:\n1. 🍔 Browse Shops\n2. 📦 My Orders\n3. 👤 My Profile\n\n*Reply with 1, 2, or 3*"
-            )
-        session["state"] = "buyer_menu"
-        return
-
-    if state == "buyer_menu":
-        if text == "browse" or text == "1":
-            shops = fetch_available_shops()
-            set_reply_map(session, "buyer_shops_map", [shop[0] for shop in shops])
-            show_shops_list(phone)
-            session["state"] = "buyer_choosing_shop"
-        elif text == "orders" or text == "2":
-            list_buyer_orders(phone)
-            session["state"] = "idle"
-        elif text == "profile" or text == "3":
-            show_buyer_profile(phone, user)
-            session["state"] = "buyer_profile"
-        else:
-            cloud.send_whatsapp_message(phone, "❌ Invalid option. Please tap a button.")
-
-    elif state == "buyer_profile":
-        if text in {"profile_change_zone", "1"}:
-            show_zone_picker(phone, "profile_zone", header_text="Change Zone")
-            session["state"] = "buyer_profile_zone"
-        elif text in {"profile_back", "2", "menu"}:
-            session["state"] = "idle"
-            handle_buyer_flow(phone, "menu", session, get_user(phone))
-        else:
-            cloud.send_whatsapp_message(phone, "❌ Please choose Change Zone or Back.")
-
-    elif state == "buyer_profile_zone":
-        zone_name = resolve_zone_choice(text.replace("profile_zone_", "zone_"))
-        if not zone_name:
-            cloud.send_whatsapp_message(phone, "❌ Zone not found. Please tap a valid zone.")
-            return
-        update_user(phone, zone=zone_name)
-        refreshed_user = get_user(phone)
-        cloud.send_whatsapp_message(phone, f"✅ Your zone has been updated to *{zone_name}*.")
-        show_buyer_profile(phone, refreshed_user)
-        session["state"] = "buyer_profile"
-
-    elif state == "buyer_choosing_shop":
-        # Handle shop selection - try phone number or numeric index
-        seller_phone = get_reply_map_value(session, "buyer_shops_map", text) or text
-        
-        # Try as numeric index first
-        try:
-            idx = int(text) - 1
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute("""
-                SELECT u.phone, u.shop_name
-                FROM users u
-                WHERE u.role = 'seller'
-                  AND u.shop_name IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM products p
-                      WHERE p.seller_phone = u.phone AND p.stock > 0
-                  )
-                ORDER BY u.shop_name
-            """)
-            shops = c.fetchall()
-            conn.close()
-            if 0 <= idx < len(shops):
-                seller_phone = shops[idx][0]
-        except ValueError:
-            pass
-        
-        seller = get_user(seller_phone)
-        if seller and seller[USER_ROLE] == 'seller':
-            session["data"]["selected_shop"] = seller_phone
-            products, _ = fetch_shop_catalog(seller_phone)
-            set_reply_map(session, "buyer_products_map", [product[0] for product in products])
-            show_catalog_buyer(phone, seller_phone)
-            session["state"] = "buyer_browsing"
-        else:
-            cloud.send_whatsapp_message(phone, "❌ Shop not found. Please try again or type 'menu'.")
-            
-    elif state == "buyer_browsing":
-        try:
-            # Handle list ID like "prod_5" or numeric input
-            pid_str = str(get_reply_map_value(session, "buyer_products_map", text) or text).replace("prod_", "")
-            pid = int(pid_str)
-            prod = get_product_by_id(pid)
-            if prod:
-                session["data"]["selected_prod"] = pid
-                session["data"]["seller_phone"] = prod[0]
-                if prod[5]:
-                    cloud.send_whatsapp_image(
-                        phone,
-                        prod[5],
-                        caption=f"{prod[2]}\nGHS {prod[3]:.2f} each"
-                    )
-                cloud.send_whatsapp_message(phone, f"How many *{prod[2]}* would you like to order?\n*Price: GHS {prod[3]:.2f} each*\nAvailable now: {prod[4]}")
-                session["state"] = "buyer_order_qty"
-            else:
-                cloud.send_whatsapp_message(phone, "Product not found. Enter another ID or 'menu'.")
-        except ValueError:
-            cloud.send_whatsapp_message(phone, "Please select a product from the menu.")
-
-    elif state == "buyer_order_qty":
-        try:
-            qty = int(text)
-            if qty < 1:
-                raise ValueError
-            pid = session["data"]["selected_prod"]
-            prod = get_product_by_id(pid)
-            if not prod:
-                cloud.send_whatsapp_message(phone, "❌ That item is no longer available. Type 'menu' to continue.")
-                session["state"] = "idle"
-                session["data"] = {}
-                return
-            if qty > prod[4]:
-                cloud.send_whatsapp_message(phone, f"❌ Only {prod[4]} portion(s) of *{prod[2]}* are available right now. Please enter a smaller quantity.")
-                return
-            
-            food_total = prod[3] * qty
-            buyer_zone = user[USER_ZONE]
-            seller_user = get_user(prod[0])
-            seller_zone = seller_user[USER_ZONE] if seller_user else ""
-            seller_landmark = seller_user[USER_LANDMARK] if seller_user else ""
-            
-            session["data"]["qty"] = qty
-            session["data"]["food_total"] = food_total
-            session["data"]["buyer_zone"] = buyer_zone
-            session["data"]["seller_zone"] = seller_zone
-            session["data"]["seller_landmark"] = seller_landmark
-            session["data"]["delivery_fee"] = 0
-            session["data"]["delivery_zone"] = ""
-            session["data"]["delivery_landmark"] = ""
-            session["data"]["delivery_address"] = ""
-
-            buttons = [
-                {"id": "fulfillment_delivery", "title": "🚚 Delivery"},
-                {"id": "fulfillment_pickup", "title": "🏪 Pickup"},
-                {"id": "cancel_order", "title": "❌ Cancel"}
-            ]
-            success = cloud.send_interactive_buttons(
-                phone,
-                f"Nice choice.\n\nItem total: GHS {food_total:.2f}\nRestaurant area: {seller_zone or 'Not set'}\nRestaurant landmark: {seller_landmark or 'Not set'}\n\nHow would you like to receive your order?",
-                buttons,
-                header_text="Choose Fulfilment"
-            )
-            if not success:
-                cloud.send_whatsapp_message(phone, "1. Delivery\n2. Pickup\n3. Cancel")
-            session["state"] = "buyer_fulfillment_method"
-        except ValueError:
-            cloud.send_whatsapp_message(phone, "Invalid quantity. Please enter a number.")
-
-    elif state == "buyer_fulfillment_method":
-        if text in {"fulfillment_pickup", "2"}:
-            session["data"]["pickup_or_delivery"] = "pickup"
-            session["data"]["delivery_fee"] = 0
-            session["data"]["delivery_zone"] = "Pickup at restaurant"
-            session["data"]["delivery_address"] = "Pickup at restaurant"
-            send_checkout_summary(phone, session)
-            session["state"] = "buyer_confirm_order"
-        elif text in {"fulfillment_delivery", "1"}:
-            session["data"]["pickup_or_delivery"] = "delivery"
-            show_buyer_zone_picker(phone, session["data"].get("seller_zone"), session["data"].get("seller_landmark"))
-            session["state"] = "buyer_delivery_zone"
-        elif text in {"cancel_order", "3"}:
-            cloud.send_whatsapp_message(phone, "❌ Order cancelled. Type 'menu' to start again.")
-            session["state"] = "idle"
-            session["data"] = {}
-        else:
-            cloud.send_whatsapp_message(phone, "❌ Please choose Delivery or Pickup.")
-
-    elif state == "buyer_delivery_zone":
-        delivery_zone = resolve_zone_choice(text.replace("buyer_zone_", "zone_"))
-        if not delivery_zone:
-            cloud.send_whatsapp_message(phone, "❌ Zone not found. Please tap a valid delivery zone.")
-            return
-
-        session["data"]["delivery_zone"] = delivery_zone
-        show_buyer_landmark_picker(phone, delivery_zone)
-        session["state"] = "buyer_delivery_landmark"
-
-    elif state == "buyer_delivery_landmark":
-        delivery_zone = session["data"].get("delivery_zone")
-        delivery_landmark = resolve_landmark_choice(delivery_zone, text.replace("buyer_landmark_", "landmark_"))
-        if not delivery_landmark:
-            cloud.send_whatsapp_message(phone, "❌ Landmark not found. Please tap a valid delivery landmark.")
-            return
-
-        session["data"]["delivery_landmark"] = delivery_landmark
-        session["data"]["delivery_fee"] = calculate_delivery_fee(
-            session["data"].get("seller_zone"),
-            session["data"].get("seller_landmark"),
-            delivery_zone,
-            delivery_landmark
-        )
-        cloud.send_whatsapp_message(phone, f"🏠 *Delivery Address*\n\nZone: {delivery_zone}\nLandmark: {delivery_landmark}\nDelivery is free for now.\n\nPlease provide your specific location details:\n*Example: Martina Hostel, Room 12 near the gate*")
-        session["state"] = "buyer_delivery_address"
-    
-    elif state == "buyer_delivery_address":
-        if len(text) < 5:
-            cloud.send_whatsapp_message(phone, "❌ Please provide a more detailed address.")
-            return
-        
-        session["data"]["delivery_address"] = text
-        send_checkout_summary(phone, session)
-        session["state"] = "buyer_confirm_order"
-
-    elif state == "buyer_confirm_order":
-        if text in {"proceed_payment", "1"}:
-            try:
-                validate_order_request(session["data"])
-            except ValueError as exc:
-                cloud.send_whatsapp_message(phone, f"❌ {exc} Please review your order and try again.")
-                session["state"] = "buyer_browsing"
-                return
-            import uuid
-            payment_ref = f"ZC_{uuid.uuid4().hex[:8]}"
-            session["data"]["payment_ref"] = payment_ref
-            
-            order_id, seller_phone, total = place_order_market(phone, session["data"], 'awaiting_payment')
-            
-            payment_url = initiate_paystack_payment(phone, total, order_id, payment_ref)
-            
-            if payment_url:
-                fulfilment = session["data"].get("pickup_or_delivery", "delivery").capitalize()
-                msg = f"💳 *Payment Required*\n\n"
-                msg += f"Order #{order_id}\n"
-                msg += f"Total: GHS {total:.2f}\n"
-                msg += f"Method: {fulfilment}\n"
-                if fulfilment.lower() == "delivery":
-                    msg += f"Zone: {session['data'].get('delivery_zone', 'N/A')}\n"
-                    msg += f"Landmark: {session['data'].get('delivery_landmark', 'N/A')}\n"
-                    msg += f"Address: {session['data'].get('delivery_address', 'N/A')}\n"
-                msg += "\n"
-                msg += f"Click to pay:\n{payment_url}\n\n"
-                msg += "After payment, you'll receive a confirmation code."
-                cloud.send_whatsapp_message(phone, msg)
-            else:
-                order_code = generate_order_code()
-                update_order_status(order_id, 'paid', order_code)
-                notify_seller(order_id, phone, total, seller_phone, session["data"])
-                cloud.send_whatsapp_message(phone, f"✅ *Order Confirmed!*\n\nOrder Code: *{order_code}*\n\nShare this code when your order is handed over. The seller has been notified.")
-            
-            session["state"] = "idle"
-            session["data"] = {}
-        elif text in {"cancel_order", "2"}:
-            cloud.send_whatsapp_message(phone, "❌ Order cancelled. Type 'menu' to start over.")
-            session["state"] = "idle"
-            session["data"] = {}
-        else:
-            cloud.send_whatsapp_message(phone, "❌ Please choose Pay Now or Cancel.")
-
-def send_checkout_summary(phone, session):
-    pid = session["data"]["selected_prod"]
-    prod = get_product_by_id(pid)
-    prod_name = prod[2] if prod else "Item"
-    fulfilment = session["data"].get("pickup_or_delivery", "delivery")
-    delivery_fee = float(session["data"].get("delivery_fee", 0) or 0)
-    total = session["data"]["food_total"] + delivery_fee
-
-    summary = f"📑 *Order Summary*\n\n"
-    summary += f"Item: {prod_name}\n"
-    summary += f"Qty: {session['data']['qty']}\n"
-    summary += f"Subtotal: GHS {session['data']['food_total']:.2f}\n"
-    if fulfilment == "delivery":
-        summary += f"Delivery ({session['data']['delivery_zone']}): Included for now\n"
-        summary += f"Landmark: {session['data'].get('delivery_landmark', 'N/A')}\n"
-        summary += f"Address: {session['data']['delivery_address']}\n"
-    else:
-        summary += "Pickup: Collect directly from the restaurant\n"
-        summary += "Delivery: Included for now\n"
-    summary += "-----------\n"
-    summary += f"*Total: GHS {total:.2f}*\n\n"
-    summary += "Proceed to payment:"
-
-    buttons = [
-        {"id": "proceed_payment", "title": "💳 Pay Now"},
-        {"id": "cancel_order", "title": "❌ Cancel"}
-    ]
-    success = cloud.send_interactive_buttons(phone, summary, buttons, header_text="Ready to Pay")
-    if not success:
-        cloud.send_whatsapp_message(phone, summary + "\n\n1. Pay Now\n2. Cancel")
-
-def show_shops_list(phone):
-    shops = fetch_available_shops()
-    
-    if not shops:
-        cloud.send_whatsapp_message(phone, "🍴 *No Shops Available*\n\nSorry, there are no food vendors listed yet. Type 'menu' to go back.")
-    else:
-        sections = []
-        rows = []
-        for s in shops:
-            rows.append({
-                "id": s[0], # phone number is the ID
-                "title": s[1], # Shop Name
-                "description": (s[2] or s[4] or s[3] or "")[:72] # Shop Description
-            })
-        sections.append({"title": "Choose a Restaurant", "rows": rows})
-        
-        success = cloud.send_interactive_list(
-            phone,
-            "🍴 *Browse Shops*\n\nChoose a restaurant to view their menu:",
-            "View Menu",
-            sections
-        )
-        
-        if not success:
-            # Fallback to text message
-            msg = "🍴 *Available Shops:*\n\n"
-            for i, s in enumerate(shops, 1):
-                msg += f"{i}. *{s[1]}*\n"
-                if s[2]:
-                    msg += f"   {s[2][:50]}\n"
-            msg += f"\n*Reply with the shop number (1-{len(shops)})*"
-            cloud.send_whatsapp_message(phone, msg)
-
-def show_catalog_buyer(phone, seller_phone):
-    normalized_seller_phone = normalize_phone(seller_phone)
-    prods, shop = fetch_shop_catalog(normalized_seller_phone)
-    shop_name = shop[0] if shop and shop[0] else "Shop"
-    shop_description = shop[1] if shop else ""
-    shop_zone = shop[2] if shop else ""
-    shop_landmark = shop[3] if shop else ""
-    shop_image = shop[4] if shop else ""
-
-    if not prods:
-        cloud.send_whatsapp_message(phone, f"🍴 *{shop_name}* has no items available right now. Type 'menu' to go back.")
-    else:
-        if shop_image:
-            caption = f"{shop_name}\n{shop_description or 'Fresh food, fast pickup and delivery.'}"
-            cloud.send_whatsapp_image(phone, shop_image, caption=caption[:1024])
-        sections = []
-        rows = []
-        for p in prods:
-            rows.append({
-                "id": f"prod_{p[0]}",
-                "title": p[1],
-                "description": f"GHS {p[2]:.2f} | {p[5]} left | {p[3][:28] if p[3] else ''}"
-            })
-        sections.append({"title": "Available Items", "rows": rows})
-        
-        success = cloud.send_interactive_list(
-            phone,
-            f"🍴 *{shop_name} Menu*\n\n{shop_description or 'Fresh campus meals.'}\nArea: {shop_zone or 'Not set'}\nLandmark: {shop_landmark or 'Not set'}\n\nSelect an item to order:",
-            "Select Item",
-            sections
-        )
-        
-        if not success:
-            # Fallback to text message
-            msg = f"🍴 *{shop_name} Menu:*\n\n"
-            for i, p in enumerate(prods, 1):
-                msg += f"{i}. *{p[1]}* - GHS {p[2]:.2f} ({p[5]} left)\n"
-                if p[3]:
-                    msg += f"   {p[3][:50]}\n"
-            msg += f"\n*Reply with item number (1-{len(prods)})*"
-            cloud.send_whatsapp_message(phone, msg)
-
-def validate_order_request(order_data):
-    pid = order_data["selected_prod"]
-    qty = int(order_data["qty"])
-    product = get_product_by_id(pid)
-    if not product:
-        raise ValueError("Selected product no longer exists.")
-    if qty < 1 or qty > product[4]:
-        raise ValueError("Selected quantity exceeds available stock.")
-    return product
-
-def place_order_market(buyer_phone, order_data, status='pending'):
-    pid = order_data["selected_prod"]
-    seller_phone = normalize_phone(order_data["seller_phone"])
-    qty = order_data["qty"]
-    validate_order_request(order_data)
-    food_total = order_data["food_total"]
-    delivery_fee = float(order_data.get("delivery_fee", 0) or 0)
-    payment_ref = order_data.get("payment_ref", "")
-    total_amount = food_total + delivery_fee
-    fulfillment_method = order_data.get("pickup_or_delivery", "delivery")
-    delivery_zone = order_data.get("delivery_zone") or order_data.get("buyer_zone", "")
-    delivery_landmark = order_data.get("delivery_landmark", "")
-    delivery_address = order_data.get("delivery_address", "")
-    
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    order_columns = get_table_columns("orders")
-    values = {
-        "buyer_phone": normalize_phone(buyer_phone),
-        "phone": normalize_phone(buyer_phone),
-        "seller_phone": seller_phone,
-        "total_price": total_amount,
-        "total": total_amount,
-        "delivery_fee": delivery_fee,
-        "delivery_zone": delivery_zone,
-        "delivery_landmark": delivery_landmark,
-        "delivery_address": delivery_address,
-        "pickup_or_delivery": fulfillment_method,
-        "status": status,
-        "payment_ref": payment_ref,
-    }
-    insert_columns = [column for column in values if column in order_columns]
-    placeholders = ", ".join(["?"] * len(insert_columns))
-    c.execute(
-        f"INSERT INTO orders ({', '.join(insert_columns)}) VALUES ({placeholders})",
-        tuple(values[column] for column in insert_columns)
-    )
-    order_id = c.lastrowid
-    
-    c.execute("INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES (?, ?, ?, ?)",
-              (order_id, pid, qty, food_total/qty))
-    conn.commit()
-    conn.close()
-    
-    return order_id, seller_phone, total_amount
-
-def notify_seller(order_id, buyer_phone, total, seller_phone, order_data=None):
-    """Notify seller of new order"""
-    order_data = order_data or {}
-    fulfilment = order_data.get("pickup_or_delivery", "delivery").capitalize()
-    seller_msg = f"🔔 *NEW ORDER!*\n\nOrder #{order_id}\nBuyer: {buyer_phone}\nTotal: GHS {total:.2f}\nMethod: {fulfilment}"
-    if fulfilment.lower() == "delivery":
-        seller_msg += f"\nZone: {order_data.get('delivery_zone', 'N/A')}"
-        seller_msg += f"\nLandmark: {order_data.get('delivery_landmark', 'N/A')}"
-        seller_msg += f"\nAddress: {order_data.get('delivery_address', 'N/A')}"
-    seller_msg += "\n\nGo to 'View Orders' to see details."
-    cloud.send_whatsapp_message(seller_phone, seller_msg)
-
-def update_order_status(order_id, status, confirmation_code=None):
-    """Update order status and optionally add confirmation code"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    if confirmation_code:
-        c.execute("UPDATE orders SET status = ?, confirmation_code = ? WHERE id = ?", 
-                  (status, confirmation_code, order_id))
-    else:
-        c.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
-    conn.commit()
-    conn.close()
-
-# =========================
-# PAYSTACK WEBHOOK
-# =========================
-@app.route("/payment/callback", methods=["GET"])
-def paystack_callback():
-    """Handle Paystack payment callback"""
-    reference = request.args.get("reference")
-    
-    if not reference:
-        return render_payment_status_page(
-            "Reference Missing",
-            "We could not find a payment reference in this callback request.",
-            tone="error"
-        ), 400
-    
-    # Verify payment
-    payment_success = verify_paystack_payment(reference)
-    
-    if payment_success:
-        order_info, error = finalize_paid_order(reference)
-        if error == "missing":
-            return render_payment_status_page(
-                "Order Not Found",
-                "Payment was confirmed, but we could not find the matching order record.",
-                tone="warning"
-            ), 404
-
-        subtitle = "Your payment went through and the seller has been updated on WhatsApp."
-        if order_info.get("already_paid"):
-            subtitle = "This payment was already confirmed earlier. Your order remains active."
-        return render_payment_status_page(
-            "Payment Successful",
-            subtitle,
-            tone="success",
-            confirmation_code=order_info.get("confirmation_code"),
-            order_id=order_info.get("order_id")
-        ), 200
-    return render_payment_status_page(
-        "Payment Verification Failed",
-        "We could not confirm this transaction yet. If you were charged, contact support with your reference.",
-        tone="error"
-    ), 400
-
-@app.route("/payment/webhook", methods=["POST"])
-def paystack_webhook():
-    """Handle Paystack webhook for payment notifications"""
-    data = request.get_json() or {}
-    
-    if data.get("event") == "charge.success":
-        reference = data.get("data", {}).get("reference")
-        if reference:
-            if verify_paystack_payment(reference):
-                finalize_paid_order(reference)
-    
-    return "OK", 200
-
-def list_buyer_orders(phone):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(f"""
-        SELECT id, total_price, status, pickup_or_delivery
-        FROM ({get_orders_view_sql()}) AS orders_view
-        WHERE buyer_phone = ?
-        ORDER BY created_at DESC
-        LIMIT 5
-    """, (normalize_phone(phone),))
-    orders = c.fetchall()
-    conn.close()
-    if not orders:
-        send_text(phone, "📭 You haven't placed any orders yet.\n\nType 'menu' to browse food!")
-    else:
-        msg = "📦 *Your Recent Orders:*\n\n"
-        for o in orders:
-            status_emoji = "✅" if o[2] in ("completed", "paid") else "🍳" if o[2] == "accepted" else "⏳" if o[2] in ("pending", "awaiting_payment") else "❌"
-            msg += f"{status_emoji} Order #{o[0]}: GHS {o[1]:.2f} [{o[3]}]\n"
-        msg += "\nType 'menu' to order more food!"
-        send_text(phone, msg)
-
 def show_buyer_profile(phone, user):
     """Show buyer profile with options to update."""
     msg = f"""👤 *Your Profile*
@@ -2979,9 +2518,9 @@ Type 'menu' to start shopping."""
 
 def add_product_db(seller_phone, name, desc, price, stock, image_url):
     normalized_phone = normalize_phone(seller_phone)
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO products (seller_phone, name, description, price, stock, image_url) VALUES (?, ?, ?, ?, ?, ?)",
+    c.execute("INSERT INTO products (seller_phone, name, description, price, stock, image_url) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
               (normalized_phone, name, desc, price, stock, image_url))
     conn.commit()
     conn.close()
@@ -3633,7 +3172,7 @@ def place_order_market(buyer_phone, order_data, status='pending'):
     delivery_landmark = order_data.get("delivery_landmark", "")
     delivery_address = order_data.get("delivery_address", "")
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     order_columns = get_table_columns("orders")
     values = {
@@ -3651,12 +3190,12 @@ def place_order_market(buyer_phone, order_data, status='pending'):
         "payment_ref": payment_ref,
     }
     insert_columns = [column for column in values if column in order_columns]
-    placeholders = ", ".join(["?"] * len(insert_columns))
+    placeholders = ", ".join(["%s"] * len(insert_columns))
     c.execute(
-        f"INSERT INTO orders ({', '.join(insert_columns)}) VALUES ({placeholders})",
+        f"INSERT INTO orders ({', '.join(insert_columns)}) VALUES ({placeholders}) RETURNING id",
         tuple(values[column] for column in insert_columns)
     )
-    order_id = c.lastrowid
+    order_id = c.fetchone()[0]
 
     item_columns = get_table_columns("order_items")
     for item in cart_items:
@@ -3670,7 +3209,7 @@ def place_order_market(buyer_phone, order_data, status='pending'):
             "special_instructions": item.get("instructions", ""),
         }
         item_insert_columns = [column for column in item_values if column in item_columns]
-        item_placeholders = ", ".join(["?"] * len(item_insert_columns))
+        item_placeholders = ", ".join(["%s"] * len(item_insert_columns))
         c.execute(
             f"INSERT INTO order_items ({', '.join(item_insert_columns)}) VALUES ({item_placeholders})",
             tuple(item_values[column] for column in item_insert_columns)
@@ -3719,9 +3258,9 @@ def show_previous_buyer_listing(phone, session, user):
     show_buyer_home(phone, user, session)
     return "buyer_menu"
 
-def handle_buyer_flow(phone, text, session, user):
+def handle_buyer_flow(phone, text, session, user, is_interactive=False, metadata=None):
     state = session.get("state", "idle")
-    text = (text or "").strip()
+    text = (metadata or text or "").strip()
     text_lower = text.lower()
     session.setdefault("data", {})
     ensure_cart(session)
@@ -4150,9 +3689,10 @@ def handle_buyer_flow(phone, text, session, user):
 # =========================
 # ADMIN FLOW
 # =========================
-def handle_admin_flow(phone, text, session):
+def handle_admin_flow(phone, text, session, is_interactive=False, metadata=None):
     state = session.get("state", "idle")
-    text_lower = text.lower().strip()
+    text = (metadata or text or "").strip()
+    text_lower = text.lower()
     admin_verified = session.get("data", {}).get("admin_verified")
 
     if state == "admin_auth_code":
@@ -4419,7 +3959,7 @@ def handle_admin_flow(phone, text, session):
         return
 
 def list_all_users(phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT name, phone, role FROM users ORDER BY created_at DESC")
     users = c.fetchall()
@@ -4431,7 +3971,7 @@ def list_all_users(phone):
     show_admin_panel(phone)
 
 def list_all_products_admin(phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT id, name, seller_phone FROM products")
     prods = c.fetchall()
@@ -4443,7 +3983,7 @@ def list_all_products_admin(phone):
     show_admin_panel(phone)
 
 def list_all_orders_admin(phone):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(f"""
         SELECT id, buyer_phone, seller_phone, total_price, status, pickup_or_delivery
@@ -4465,7 +4005,7 @@ def list_all_orders_admin(phone):
 
 def show_marketplace_stats(phone):
     """Show marketplace statistics."""
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     
     # Count users
@@ -4509,7 +4049,7 @@ def show_marketplace_stats(phone):
     show_admin_panel(phone)
 
 def get_platform_snapshot():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM users WHERE role = 'buyer'")
     buyers = c.fetchone()[0]
