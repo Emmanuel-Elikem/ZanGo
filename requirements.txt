@@ -5,3 +5,11 @@ twilio
 click
 rich
 tabulate
+
+
+
+1. The pop up that shows on the inventory, for them to adjust stock is too small, I mean the pop up after they click on change on the main adjust stock popup
+2. the order summary where they can input the customer name, discount and stuff, doesn't have the scroll wheel so when the window is small,all the content of this tab doesn't show, check it andmake sure useers can scroll there too, as well as other tabs where users cannot scroll, make sure everywhere is scrollable
+3. the returns page should show the all the sales from that day that they can easily click on it to make a refund you get it, and they can filter for sales from other days
+4. the new purchase, change it to something easily understandable, like to let them know it's a new purchase from supplier or stock, make sure across board all texts words, adn stuff are generic to ghanaian market, as in the lay man understands each feature and simple description should be everywhere, literall everywhere, make sure you do this across board for the entire app, for every single feature, also add a last page where every single feature is explained there, make the ui for it nicce, more of like a dropdown for each explanantion sorta like FAQs, explaining how to do every single thing on the app, literally every single thing and every single feature, shoukld be explained there, and there should be search baar there for them to search and if there are any description or feature explanation with whatever they're searcjing for the results will be displaying while they search so they find explanations easily and know how to use the app easily, on the same screen, They should also be able to add custom explanation, that'll add up to the existing ones there
+5. WHEN they search for a medicine at the dashbaord or the one next to the notification icon it doens't work, also the other searchbar at the POS/Sales that actually works, when they search for medicines, and select a particular one, they should be able to click on it to see the full details like shelf location, and others that they inputted for that medicine you get it, so maybe a more button or something. And also the seach results as they're typing should have the shelf location at the right side, and the price shoudl instead be next to the name.
