@@ -1268,14 +1268,12 @@ def process_message(from_phone, msg_body, is_interactive=False, metadata=None):
             if cmd == "/admin off":
                 session.setdefault("data", {})["admin_mode"] = False
                 save_session(from_phone, session)
-                from whatsapp_cloud_helper import get_whatsapp_cloud
-                get_whatsapp_cloud().send_whatsapp_message(from_phone, "⚙️ Admin mode *OFF*. You are now interacting with the bot as a regular user. Type '/admin on' to return to the admin panel.")
+                cloud.send_whatsapp_message(from_phone, "⚙️ Admin mode *OFF*. You are now interacting with the bot as a regular user. Type '/admin on' to return to the admin panel.")
                 return True
             elif cmd == "/admin on":
                 session.setdefault("data", {})["admin_mode"] = True
                 save_session(from_phone, session)
-                from whatsapp_cloud_helper import get_whatsapp_cloud
-                get_whatsapp_cloud().send_whatsapp_message(from_phone, "⚙️ Admin mode *ON*. Type 'menu' to view your admin panel.")
+                cloud.send_whatsapp_message(from_phone, "⚙️ Admin mode *ON*. Type 'menu' to view your admin panel.")
                 return True
 
         # Check if the admin is actively in admin mode (default to True)
@@ -1296,8 +1294,7 @@ def process_message(from_phone, msg_body, is_interactive=False, metadata=None):
         elif user[USER_ROLE] == 'buyer':
             handle_buyer_flow(from_phone, msg_body, session, user, is_interactive, metadata)
         else:
-            from whatsapp_cloud_helper import get_whatsapp_cloud
-            get_whatsapp_cloud().send_whatsapp_message(from_phone, "Welcome! Type 'menu' to see your options.")
+            cloud.send_whatsapp_message(from_phone, "Welcome! Type 'menu' to see your options.")
 
         save_session(from_phone, session)
         return True
@@ -1422,9 +1419,7 @@ def send_text(to, text):
 # ONBOARDING FLOW
 # =========================
 def handle_onboarding(phone, text, session, is_interactive=False, metadata=None):
-    from whatsapp_cloud_helper import get_whatsapp_cloud
     import re
-    cloud = get_whatsapp_cloud()
     
     state = session.get("state", "new_user")
     text = (text or "").strip()
