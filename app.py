@@ -1260,7 +1260,28 @@ def process_message(from_phone, msg_body, is_interactive=False, metadata=None):
     
     try:
         admin_phone = os.getenv("ADMIN_PHONE", "").lstrip('+')
-        is_admin = normalized_phone == admin_phone
+        is_admin_phone = normalized_phone == admin_phone
+        
+        # Allow the admin to toggle their admin status context on/off for testing
+        if is_admin_phone:
+            cmd = msg_body.strip().lower()
+            if cmd == "/admin off":
+                session.setdefault("data", {})["admin_mode"] = False
+                save_session(from_phone, session)
+                from whatsapp_cloud_helper import get_whatsapp_cloud
+                get_whatsapp_cloud().send_whatsapp_message(from_phone, "⚙️ Admin mode *OFF*. You are now interacting with the bot as a regular user. Type '/admin on' to return to the admin panel.")
+                return True
+            elif cmd == "/admin on":
+                session.setdefault("data", {})["admin_mode"] = True
+                save_session(from_phone, session)
+                from whatsapp_cloud_helper import get_whatsapp_cloud
+                get_whatsapp_cloud().send_whatsapp_message(from_phone, "⚙️ Admin mode *ON*. Type 'menu' to view your admin panel.")
+                return True
+
+        # Check if the admin is actively in admin mode (default to True)
+        admin_mode_active = session.get("data", {}).get("admin_mode", True)
+        is_admin = is_admin_phone and admin_mode_active
+        
         admin_verified = session.get("data", {}).get("admin_verified")
         
         # Admin always uses the admin flow first
