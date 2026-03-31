@@ -91,6 +91,14 @@ def init_db():
         zone TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    # Sessions: phone, state, data (jsonb), cart (jsonb), updated_at
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        phone VARCHAR(20) PRIMARY KEY,
+        state VARCHAR(50) NOT NULL,
+        data JSONB DEFAULT '{}'::jsonb,
+        cart JSONB DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
     # Products: associated with a seller
     c.execute('''CREATE TABLE IF NOT EXISTS products (
         id SERIAL PRIMARY KEY,
